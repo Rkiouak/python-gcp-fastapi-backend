@@ -5,19 +5,15 @@ import jwt
 from fastapi import Depends, FastAPI, HTTPException, status
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from jwt.exceptions import InvalidTokenError
-from passlib.context import CryptContext
 from pydantic import BaseModel
-import logging
-import uvicorn
 from google.cloud import firestore
 from google.cloud.firestore_v1 import FieldFilter
 import secretmanager
-
+import bcrypt
 
 SECRET_KEY = secretmanager.get_secret("projects/4042672389/secrets/blog-auth-key/versions/latest")
 ALGORITHM = "HS256"
 
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
 
@@ -40,12 +36,23 @@ class UserInDB(User):
     hashed_password: str
 
 def verify_password(plain_password, hashed_password):
-    return pwd_context.verify(plain_password, hashed_password)
+    print(get_password_hash(plain_password))
+    print(hashed_password)
+    print("result of checkpw: " + str(bcrypt.checkpw(
+        bytes(plain_password, encoding="utf-8"),
+        bytes(hashed_password, encoding="utf-8"),
+    )))
+    return bcrypt.checkpw(
+        bytes(plain_password, encoding="utf-8"),
+        bytes(hashed_password, encoding="utf-8"),
+    )
 
 
 def get_password_hash(password):
-    return pwd_context.hash(password)
-
+    return bcrypt.hashpw(
+        bytes(password, encoding="utf-8"),
+        bcrypt.gensalt(),
+    )
 
 def get_user(username: str):
     db = firestore.Client()

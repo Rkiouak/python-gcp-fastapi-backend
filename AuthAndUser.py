@@ -1,17 +1,16 @@
 from datetime import datetime, timedelta, timezone
-from typing import Annotated, Optional
+from typing import Annotated
 
+import bcrypt
 import jwt
-from fastapi import Depends, FastAPI, HTTPException, status
-from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
-from jwt.exceptions import InvalidTokenError
-from pydantic import BaseModel
+from fastapi import Depends, HTTPException, status
+from fastapi.security import OAuth2PasswordBearer
 from google.cloud import firestore
 from google.cloud.firestore_v1 import FieldFilter
-import secretmanager
-import bcrypt
+from jwt.exceptions import InvalidTokenError
+from pydantic import BaseModel
 
-SECRET_KEY = secretmanager.get_secret("projects/4042672389/secrets/blog-auth-key/versions/latest")
+import secretmanager
 ALGORITHM = "HS256"
 
 
@@ -35,13 +34,12 @@ class UserInDB(User):
     username: str
     hashed_password: str
 
+def get_secret_key():
+    # You might want to add caching here if called frequently
+    return secretmanager.get_secret("projects/4042672389/secrets/blog-auth-key/versions/latest")
+
+
 def verify_password(plain_password, hashed_password):
-    print(get_password_hash(plain_password))
-    print(hashed_password)
-    print("result of checkpw: " + str(bcrypt.checkpw(
-        bytes(plain_password, encoding="utf-8"),
-        bytes(hashed_password, encoding="utf-8"),
-    )))
     return bcrypt.checkpw(
         bytes(plain_password, encoding="utf-8"),
         bytes(hashed_password, encoding="utf-8"),
@@ -79,7 +77,7 @@ def create_access_token(data: dict, expires_delta: timedelta | None = None):
     else:
         expire = datetime.now(timezone.utc) + timedelta(minutes=15)
     to_encode.update({"exp": expire})
-    encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+    encoded_jwt = jwt.encode(to_encode, get_secret_key(), algorithm=ALGORITHM)
     return encoded_jwt
 
 
@@ -90,7 +88,7 @@ async def get_current_user(token: Annotated[str, Depends(oauth2_scheme)]):
         headers={"WWW-Authenticate": "Bearer"},
     )
     try:
-        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        payload = jwt.decode(token, get_secret_key(), algorithms=[ALGORITHM])
         username: str = payload.get("sub")
         if username is None:
             raise credentials_exception

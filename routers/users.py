@@ -1,32 +1,18 @@
-from contextlib import asynccontextmanager
-
-from fastapi import APIRouter
+from fastapi import FastAPI, Request, APIRouter
 import AuthAndUser as auth
 from typing import Annotated, Optional
 from fastapi import Depends, FastAPI, HTTPException, status
 import logging
 from google.cloud import firestore
 from cryptography.fernet import Fernet
-import secretmanager
 import base64
 import pickle
 import sendgridemail
-from domain.user import SignUpUser
+from domain.user import SignUpUser, Challenge
 
 logger = logging.getLogger('uvicorn.error')
 
 router = APIRouter()
-app = FastAPI()
-
-
-fernet = None
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    global fernet
-    fernet = Fernet(
-    base64.b64decode(secretmanager.get_secret("projects/4042672389/secrets/fernet_asymmetric_key/versions/1")))
-    yield
 
 @router.get("/users/me/", response_model=auth.User, tags=["users"])
 async def read_users_me(
@@ -35,15 +21,17 @@ async def read_users_me(
     return current_user
 
 @router.post("/users/")
-async def create_user(challenge: str,  tags=["users"]):
-    global fernet
-    decoded_challenge = base64.b64decode(challenge)
-    decrypted_challenge = fernet.decrypt(decoded_challenge)
+async def create_user(challenge: Challenge, request: Request,  tags=["users"]):
+    decoded_challenge = base64.b64decode(challenge.challenge)
+    decrypted_challenge = request.app.state.fernet.decrypt(decoded_challenge)
     user = pickle.loads(decrypted_challenge)
     logger.info(f"Creating user {user}")
     print(user)
     db = firestore.Client()
     users_ref = db.collection("users")
+    existing_users = users_ref.document().where("email", "==", user.email).to_list()
+    if existing_users.count() > 0:
+        raise Exception(f"User with email: {user.email} already exists. Please log in.")
     users_ref.document(user.username).set({
         "username": user.username,
         "given_name": user.given_name,
@@ -54,8 +42,8 @@ async def create_user(challenge: str,  tags=["users"]):
     return user
 
 @router.post("/challenge/")
-async def create_challenge(user: SignUpUser):
-    global fernet
-    challenge_bytes = fernet.encrypt(pickle.dumps(user))
-    challenge = base64.b64encode(challenge_bytes)
+async def create_challenge(user: SignUpUser, request: Request):
+    challenge_bytes = request.app.state.fernet.encrypt(pickle.dumps(user))
+    challenge = base64.b64encode(challenge_bytes).decode('utf-8')
     sendgridemail.send_email(user, challenge)
+    return {"message":f"Validate your signup using the email sent to {user.email}"}

@@ -7,3 +7,6 @@ class SignUpUser(BaseModel):
     family_name: str | None = None
     password: str | None = None
     disabled: bool | None = None
+
+class Challenge(BaseModel):
+    challenge: str

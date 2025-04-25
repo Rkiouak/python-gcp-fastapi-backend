@@ -5,6 +5,10 @@ from fastapi import Depends, FastAPI, HTTPException, status
 from fastapi.security import OAuth2PasswordRequestForm
 import logging
 import AuthAndUser as auth
+from cryptography.fernet import Fernet
+import secretmanager
+from contextlib import asynccontextmanager
+import base64
 
 from routers import users
 
@@ -12,8 +16,15 @@ ACCESS_TOKEN_EXPIRE_MINUTES = 30
 
 logger = logging.getLogger('uvicorn.error')
 
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    logger.info('Starting lifespan')
+    app.state.fernet = Fernet(
+    base64.b64decode(secretmanager.get_secret("projects/4042672389/secrets/fernet_asymmetric_key/versions/1")))
+    logger.info('fernet set on app')
+    yield
 
-app = FastAPI()
+app = FastAPI(lifespan=lifespan)
 app.include_router(users.router)
 
 @app.post("/token")

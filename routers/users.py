@@ -1,10 +1,9 @@
-from fastapi import FastAPI, Request, APIRouter
+from fastapi import Request, APIRouter
 import AuthAndUser as auth
-from typing import Annotated, Optional
-from fastapi import Depends, FastAPI, HTTPException, status
+from typing import Annotated
+from fastapi import Depends
 import logging
 from google.cloud import firestore
-from cryptography.fernet import Fernet
 import base64
 import pickle
 import sendgridemail
@@ -29,9 +28,14 @@ async def create_user(challenge: Challenge, request: Request,  tags=["users"]):
     print(user)
     db = firestore.Client()
     users_ref = db.collection("users")
-    existing_users = users_ref.where("email", "==", user.email).to_list()
-    if existing_users.count() > 0:
+    existing_users = users_ref.where("email", "==", user.email).stream()
+    result = next(existing_users, None)
+    if result is not None:
         raise Exception(f"User with email: {user.email} already exists. Please log in.")
+    existing_users = users_ref.where("username", "==", user.username).stream()
+    result = next(existing_users, None)
+    if result is not None:
+        raise Exception(f"User with username: {user.username} already exists. Please log in.")
     users_ref.document(user.username).set({
         "username": user.username,
         "given_name": user.given_name,

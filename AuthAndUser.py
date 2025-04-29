@@ -9,6 +9,7 @@ from google.cloud import firestore
 from google.cloud.firestore_v1 import FieldFilter
 from jwt.exceptions import InvalidTokenError
 from pydantic import BaseModel
+import logging
 
 import secretmanager
 ALGORITHM = "HS256"
@@ -104,6 +105,7 @@ async def get_current_user(token: Annotated[str, Depends(oauth2_scheme)]):
 async def get_current_active_user(
     current_user: Annotated[User, Depends(get_current_user)],
 ):
+    logging.info("current_user: %s", current_user)
     if current_user.disabled:
         raise HTTPException(status_code=400, detail="Inactive user")
     return current_user

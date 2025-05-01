@@ -90,14 +90,13 @@ async def upload_to_gcs(
 
 @router.get("/", response_model=List[PostSnippet])
 async def get_all_post_snippets(
-    current_user: Annotated[auth.User, Depends(auth.get_current_active_user)],
     db: firestore.Client = Depends(get_firestore_client)
 ):
     """Retrieve summaries (including image URL) for all blog posts."""
     posts_collection = db.collection('posts')
     try:
         all_post_snippets = []
-        docs = posts_collection.stream()
+        docs = posts_collection.order_by("date", direction=firestore.Query.DESCENDING).stream()
         for doc in docs:
             post_data = doc.to_dict()
             post_data['id'] = doc.id
@@ -118,7 +117,6 @@ async def get_all_post_snippets(
 @router.get("/{post_id}", response_model=Post)
 async def get_post_by_id(
     post_id: str,
-    current_user: Annotated[auth.User, Depends(auth.get_current_active_user)],
     db: firestore.Client = Depends(get_firestore_client)
 ):
     """Retrieve a specific blog post (including image URL) by its ID."""
@@ -156,6 +154,8 @@ async def create_post(
     an optional image file upload (max 600 KB).
     Image is uploaded to GCS; URL is stored.
     """
+    if current_user.username != "mrkiouak@gmail.com":
+        raise HTTPException(status_code=403, detail="You are not authorized to post.")
     # --- Validate Text Field Sizes ---
     # Check title size
     if len(title.encode('utf-8')) > MAX_TEXT_FIELD_SIZE_BYTES:

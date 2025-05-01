@@ -23,8 +23,7 @@ from google.cloud import firestore
 from google.cloud import storage # <-- Import GCS client
 
 # Import routers
-from routers import users, posts # Ensure posts is imported
-
+from routers import users, posts, conversations
 ACCESS_TOKEN_EXPIRE_MINUTES = 150
 
 logger = logging.getLogger('uvicorn.error')
@@ -32,9 +31,7 @@ logger = logging.getLogger('uvicorn.error')
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Setup: Runs before the application starts receiving requests
     logger.info("Application startup: Initializing resources...")
-    # Initialize Fernet
     try:
         app.state.fernet = Fernet(
             base64.b64decode(secretmanager.get_secret("projects/4042672389/secrets/fernet_asymmetric_key/versions/1"))
@@ -44,33 +41,35 @@ async def lifespan(app: FastAPI):
         logger.error(f"Failed to initialize Fernet: {e}")
         app.state.fernet = None
 
-    # Initialize Firestore Client
     try:
-        app.state.db = firestore.Client()
-        logger.info("Firestore client initialized.")
+        app.state.db = firestore.AsyncClient()
+        logger.info("Firestore Async client initialized.")
     except Exception as e:
-        logger.error(f"Failed to initialize Firestore client: {e}")
+        logger.error(f"Failed to initialize Firestore Async client: {e}")
         app.state.db = None
 
-    # Initialize Google Cloud Storage Client  <-- NEW
     try:
         app.state.gcs_client = storage.Client()
         logger.info("Google Cloud Storage client initialized.")
     except Exception as e:
         logger.error(f"Failed to initialize GCS client: {e}")
-        app.state.gcs_client = None # Indicate failure
-
+        app.state.gcs_client = None
 
     yield
-    # Teardown: Runs after the application finishes handling requests
     logger.info("Application shutdown: Cleaning up resources...")
-    # GCS and Firestore clients typically don't need explicit close() for standard usage
+    if hasattr(app.state, 'db') and app.state.db:
+        try:
+            await app.state.db.close() # Close the async client
+            logger.info("Firestore Async client closed.")
+        except Exception as e:
+             logger.error(f"Error closing Firestore client: {e}")
     pass
 
 
 app = FastAPI(lifespan=lifespan)
 app.include_router(users.router)
 app.include_router(posts.router)
+app.include_router(conversations.router)
 
 app.add_middleware(
     TrustedHostMiddleware, allowed_hosts=["musings-mr.net", "*.musings-mr.net", "localhost", "127.0.0.1"]

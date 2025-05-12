@@ -19,7 +19,7 @@ def send_email(user: SignUpUser, challenge: str):
         from_email='matt@rkiouak.com',
         to_emails=user.email,
         subject='Complete your musings-mr.net sign up',
-        html_content=f'<strong>Hello{name},</strong><p>To complete your musings-mr.net signup, please click <a href=\"https://musings-mr.net/users/validate?challenge={challenge}\"> here</a> </p>'
+        html_content=f'<strong>Hello{name},</strong><p>To complete your musings-mr.net signup, please click <a href=\"https://musings-mr.net/user/validate?challenge={challenge}\"> here</a> </p>'
     )
     try:
         sg = sendgrid.SendGridAPIClient(secretmanager.get_secret("projects/4042672389/secrets/sendgrid-api-key/versions/latest"))

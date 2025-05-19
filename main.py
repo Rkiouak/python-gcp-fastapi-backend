@@ -23,7 +23,7 @@ from google.cloud import firestore
 from google.cloud import storage # <-- Import GCS client
 
 # Import routers
-from routers import users, posts, conversations
+from routers import users, posts, conversations, experiments
 ACCESS_TOKEN_EXPIRE_MINUTES = 150
 
 logger = logging.getLogger('uvicorn.error')
@@ -70,6 +70,7 @@ app = FastAPI(lifespan=lifespan)
 app.include_router(users.router)
 app.include_router(posts.router)
 app.include_router(conversations.router)
+app.include_router(experiments.router)
 
 app.add_middleware(
     TrustedHostMiddleware, allowed_hosts=["musings-mr.net", "*.musings-mr.net", "localhost", "127.0.0.1"]

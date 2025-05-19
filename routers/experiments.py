@@ -1,41 +1,41 @@
 import uuid
 import logging
 from typing import List, Optional, Union, Annotated
-from datetime import datetime, timezone
-import json
-import asyncio # Added for running synchronous IO in threads
+from datetime import datetime, timezone  # Ensure timezone is imported
+import asyncio
 
-from fastapi import APIRouter, HTTPException, Body, Depends, Request, status
+from fastapi import APIRouter, HTTPException, Body, Depends, Request, status, Query  # Added Query
 from pydantic import BaseModel, Field, ValidationError
 from google.cloud import firestore
 from google.cloud.firestore import AsyncClient
-from google.cloud import storage # Added for GCS client type hint
+from google.cloud import storage
 
 import vertexai
-# Updated to include ImageGenerationModel and Image (if needed for other operations, though not directly used in this snippet for image bytes)
-from vertexai.generative_models import GenerativeModel, Part as GeminiPart, GenerationConfig, SafetySetting, HarmCategory # Renamed Part to GeminiPart to avoid conflict if vertexai.vision_models.Image also has Part
-from vertexai.preview.vision_models import ImageGenerationModel # For Imagen
-# If you use vertexai.vision_models.Image, you might need:
-# from vertexai.vision_models import Image as VisionImage
+from vertexai.generative_models import GenerativeModel, GenerationConfig, SafetySetting, HarmCategory
+from vertexai.preview.vision_models import ImageGenerationModel
 
 from google.auth import exceptions as google_auth_exceptions
 
 import AuthAndUser as auth
+from services.ai_story_utils import (
+    build_story_generation_prompt,
+    generate_story_from_prompt,
+    generate_and_upload_image,
+    GeminiStructuredResponse
+)
 
 logger = logging.getLogger('uvicorn.error')
 
-# ... (rest of your existing constants like GCP_PROJECT_ID, GCP_LOCATION, GEMINI_MODEL_NAME)
-IMAGE_GEN_MODEL_NAME = "imagen-3.0-generate-002" # Model for image generation
-GCS_BUCKET_NAME = "musings-mr.net" # Define GCS bucket name
-
+IMAGE_GEN_MODEL_NAME_CONFIG = "imagen-3.0-generate-002"
+TEXT_GEN_MODEL_NAME_CONFIG = "gemini-2.0-flash"
+GCS_BUCKET_NAME_CONFIG = "musings-mr.net"
 GCP_PROJECT_ID = "clojure-gen-blog"
 GCP_LOCATION = "us-central1"
-GEMINI_MODEL_NAME = "gemini-2.0-flash"
 
 _vertex_ai_initialized = False
 
+
 def ensure_vertex_ai_initialized():
-    """Initializes Vertex AI if not already done."""
     global _vertex_ai_initialized
     if not _vertex_ai_initialized:
         try:
@@ -44,7 +44,8 @@ def ensure_vertex_ai_initialized():
             _vertex_ai_initialized = True
             logger.info("Vertex AI initialized successfully.")
         except google_auth_exceptions.DefaultCredentialsError as e:
-            logger.error(f"Vertex AI DefaultCredentialsError: {e}. Ensure ADC is configured or service account is set up.")
+            logger.error(
+                f"Vertex AI DefaultCredentialsError: {e}. Ensure ADC is configured or service account is set up.")
             raise HTTPException(status_code=500, detail="Vertex AI authentication failed. Check server configuration.")
         except Exception as e:
             logger.error(f"Failed to initialize Vertex AI: {e}")
@@ -52,14 +53,21 @@ def ensure_vertex_ai_initialized():
 
 
 async def get_firestore_client(request: Request) -> AsyncClient:
-    """Dependency function to get the Firestore AsyncClient."""
     if not hasattr(request.app.state, 'db') or not request.app.state.db:
         logger.error("Firestore client not initialized or unavailable.")
         raise HTTPException(status_code=503, detail="Database service unavailable")
     if not isinstance(request.app.state.db, AsyncClient):
-         logger.error("Firestore client is not an AsyncClient.")
-         raise HTTPException(status_code=503, detail="Database service misconfigured")
+        logger.error("Firestore client is not an AsyncClient.")
+        raise HTTPException(status_code=503, detail="Database service misconfigured")
     return request.app.state.db
+
+
+async def get_gcs_client(request: Request) -> storage.Client:
+    if not hasattr(request.app.state, 'gcs_client') or not request.app.state.gcs_client:
+        logger.error("GCS client not initialized or unavailable in app state.")
+        raise HTTPException(status_code=503, detail="GCS service unavailable")
+    return request.app.state.gcs_client
+
 
 router = APIRouter(
     prefix="/experiments",
@@ -67,426 +75,333 @@ router = APIRouter(
     dependencies=[Depends(auth.get_current_active_user)],
 )
 
-# --- Constants ---
 CAMPFIRE_DAILY_LIMIT = 5
 USERS_COLLECTION = "users"
 USAGE_SUBCOLLECTION = "usage"
 CAMPFIRES_SUBCOLLECTION = "campfires"
 RATE_LIMIT_BYPASS_EMAIL = "mrkiouak@gmail.com"
 
-# --- Pydantic Models ---
+
 class CampfireChatTurn(BaseModel):
-    """Represents a single turn in the campfire chat."""
     id: str = Field(default_factory=lambda: str(uuid.uuid4()))
     sender: str
     text: str
+    imageUrl: Optional[str] = Field(default=None)
+    promptForUser: Optional[str] = Field(default=None)
 
-class GeminiStructuredResponse(BaseModel):
-    """Expected structure for the JSON response from Gemini."""
-    storyContinuation: str
-    nextUserPrompt: str
 
 class CampfireGetResponse(BaseModel):
-    """Response model for the initial GET request."""
     storyContent: str
-    prompt: str
     chatTurns: List[CampfireChatTurn]
-    newImageUrl: Optional[str] = Field(default=None, description="URL of an image relevant to the initial story state, if available.")
-    hasActiveSessionToday: bool # New field
+    hasExistingSession: bool  # MODIFIED: Renamed from hasActiveSessionToday
+
 
 class CampfirePostRequest(BaseModel):
-    """Request model for posting a new turn."""
-    previousContent: str # The cumulative story text so far
-    prompt: str # The prompt the user was responding to
+    previousContent: str
     inputText: str
-    # Client should send the current chat history to be appended to
     chatTurns: List[CampfireChatTurn] = Field(default_factory=list)
 
+
 class CampfirePostResponse(BaseModel):
-    """Response model after processing a user's turn."""
-    storyContent: str # The updated cumulative story text
-    prompt: str # The next prompt for the user
-    chatTurns: List[CampfireChatTurn] # The updated list of chat turns
-    newImageUrl: Optional[str] = Field(default=None, description="URL of a newly generated image relevant to the story turn, if available.")
+    storyContent: str
+    chatTurns: List[CampfireChatTurn]
 
 
-async def generate_image_for_story(
-        prompt_text: str,
-        request: Request,
-        current_user: auth.User
-) -> Optional[str]:
-    """
-    Generates an image based on the prompt_text using Vertex AI's Imagen model
-    and uploads it to Google Cloud Storage.
-    Returns the public URL of the image, or None if an error occurs.
-    """
-    ensure_vertex_ai_initialized()
-    logger.info(
-        f"User '{current_user.username}' attempting to generate image for story with prompt: '{prompt_text[:100]}...'")
+class CampfireDateListResponse(BaseModel):
+    dates: List[str] = Field(
+        description="A list of dates (YYYY-MM-DD) for which campfire stories exist, sorted descending.")
+
+
+@router.get("/campfire/list", response_model=CampfireDateListResponse)
+async def list_campfire_story_dates(
+        current_user: Annotated[auth.User, Depends(auth.get_current_active_user)],
+        db: AsyncClient = Depends(get_firestore_client)
+):
+    logger.info(f"User '{current_user.username}' requesting list of their campfire story dates.")
+    story_dates = []
+    try:
+        campfires_collection_ref = db.collection(USERS_COLLECTION) \
+            .document(current_user.username) \
+            .collection(CAMPFIRES_SUBCOLLECTION)
+        async for doc_snapshot in campfires_collection_ref.select([]).stream():
+            story_dates.append(doc_snapshot.id)
+        story_dates.sort(reverse=True)
+        logger.info(f"Found {len(story_dates)} campfire story dates for user '{current_user.username}'.")
+        return CampfireDateListResponse(dates=story_dates)
+    except Exception as e:
+        logger.exception(f"Error listing campfire story dates for user '{current_user.username}': {e}")
+        raise HTTPException(status_code=500, detail="Failed to retrieve story dates list.")
+
+
+@router.get("/campfire", response_model=CampfireGetResponse)
+async def get_campfire_start(
+        current_user: Annotated[auth.User, Depends(auth.get_current_active_user)],
+        db: AsyncClient = Depends(get_firestore_client),
+        date: Optional[str] = Query(None,
+                                    description="Optional date in YYYY-MM-DD format to fetch a specific campfire story. Defaults to today's date.",
+                                    alias="date_str")  # MODIFIED: Added query param
+):
+    logger.info(f"User '{current_user.username}' requesting campfire story. Provided date_str: '{date}'.")
+
+    target_date_str: str
+    if date:
+        try:
+            # Validate YYYY-MM-DD format. strptime raises ValueError if format doesn't match.
+            datetime.strptime(date, "%Y-%m-%d")
+            target_date_str = date
+            logger.info(f"Using provided date: {target_date_str} for user '{current_user.username}'.")
+        except ValueError:
+            logger.warning(f"Invalid date format '{date}' provided by user '{current_user.username}'.")
+            raise HTTPException(status_code=400, detail="Invalid date format. Please use YYYY-MM-DD.")
+    else:
+        # Default to today's date in UTC
+        target_date_str = datetime.now(timezone.utc).strftime('%Y-%m-%d')
+        logger.info(f"Defaulting to today's date: {target_date_str} for user '{current_user.username}'.")
+
+    campfire_log_ref = db.collection(USERS_COLLECTION) \
+        .document(current_user.username) \
+        .collection(CAMPFIRES_SUBCOLLECTION).document(target_date_str)
+
+    has_existing_session = False
+    initial_prompt_for_user = "How does the story begin?"
+    initial_story_content = "The campfire crackles, waiting for a tale..."
 
     try:
-        image_model = ImageGenerationModel.from_pretrained(IMAGE_GEN_MODEL_NAME)
+        doc = await campfire_log_ref.get()
+        if doc.exists:
+            logger.info(f"Found existing campfire log for user '{current_user.username}' for date {target_date_str}.")
+            saved_data = doc.to_dict()
+            has_existing_session = True  # Record found for the target date
 
-        # generate_images is synchronous, run in a thread pool
-        generated_image_response = await asyncio.to_thread(
-            image_model.generate_images,
-            prompt=prompt_text,
-            number_of_images=1,
-            # You can add other parameters like aspect_ratio="1:1", safety_settings, etc.
-            # E.g., aspect_ratio="16:9"
-        )
+            parsed_chat_turns = []
+            if "chatTurns" in saved_data and isinstance(saved_data["chatTurns"], list):
+                for turn_data_dict in saved_data["chatTurns"]:
+                    if not isinstance(turn_data_dict, dict): continue
+                    turn_data_dict.setdefault('imageUrl', None)
+                    turn_data_dict.setdefault('promptForUser', None)
+                    try:
+                        parsed_chat_turns.append(CampfireChatTurn(**turn_data_dict))
+                    except ValidationError as ve:
+                        logger.error(
+                            f"Validation error for a GET chat turn (date: {target_date_str}): {ve}. Data: {turn_data_dict}")
+                saved_data["chatTurns"] = parsed_chat_turns
 
-        if not generated_image_response or not generated_image_response.images:
-            logger.warning(f"Image generation failed or returned no images for user '{current_user.username}'.")
-            return None
+            if not saved_data.get("chatTurns"):
+                logger.warning(
+                    f"Chat turns empty/malformed for user {current_user.username}, date {target_date_str}. Initializing.")
+                first_turn = CampfireChatTurn(id=f'start_error_get_{target_date_str}', sender='Storyteller',
+                                              text='The adventure begins (or had an issue loading)!', imageUrl=None,
+                                              promptForUser=initial_prompt_for_user)
+                saved_data["chatTurns"] = [first_turn]
 
-        image_obj = generated_image_response.images[0]
-        # Check if _image_bytes attribute exists and is populated
-        if hasattr(image_obj, '_image_bytes') and image_obj._image_bytes:
-            image_bytes = image_obj._image_bytes
-        else:
-            # Fallback: save to a temporary in-memory buffer or temp file if _image_bytes is not available
-            logger.info("'_image_bytes' not directly available. Saving image to temporary file to get bytes.")
-            # This part would require careful handling of temp files or buffers.
-            # For this example, let's log a warning and return if bytes aren't easily accessible.
-            # A more robust solution would implement the save-to-temp-file-and-read pattern here.
-            temp_filename_for_bytes = f"/tmp/temp_image_{uuid.uuid4()}.png"  # Ensure /tmp is writable
+            if "storyContent" not in saved_data or not saved_data["storyContent"]:
+                saved_data["storyContent"] = initial_story_content
+                if parsed_chat_turns:
+                    story_parts = [turn.text for turn in parsed_chat_turns if turn.text]
+                    if story_parts: saved_data["storyContent"] = "\n\n".join(story_parts)
+
             try:
-                image_obj.save(location=temp_filename_for_bytes, include_watermark=False)  # Or True if desired
-                with open(temp_filename_for_bytes, "rb") as f:
-                    image_bytes = f.read()
-                import os
-                os.remove(temp_filename_for_bytes)
-                logger.info(f"Successfully read image bytes from temporary file for user '{current_user.username}'.")
-            except Exception as e_save:
+                # Remove fields not in response model to prevent validation error from old data
+                keys_to_pop = ["newImageUrl", "prompt", "savedAt", "hasActiveSessionToday"]
+                for key_to_pop in keys_to_pop:
+                    saved_data.pop(key_to_pop, None)
+
+                # Ensure required fields for CampfireGetResponse are present
+                final_story_content = saved_data.get("storyContent", initial_story_content)
+                final_chat_turns = saved_data.get("chatTurns", [])
+                if not final_chat_turns:  # If somehow still empty, provide a default
+                    final_chat_turns = [CampfireChatTurn(id=f'default_final_{target_date_str}', sender='Storyteller',
+                                                         text='Welcome to the campfire!', imageUrl=None,
+                                                         promptForUser=initial_prompt_for_user)]
+                    if final_story_content == initial_story_content:  # And if story content is also placeholder
+                        final_story_content = 'Welcome to the campfire!'
+
+                return CampfireGetResponse(
+                    storyContent=final_story_content,
+                    chatTurns=final_chat_turns,
+                    hasExistingSession=has_existing_session  # This is True here
+                )
+            except ValidationError as e:
                 logger.error(
-                    f"Failed to save image to temp file or read bytes for user '{current_user.username}': {e_save}")
-                return None
+                    f"Final validation error for CampfireGetResponse from saved data (date: {target_date_str}) for user {current_user.username}: {e}. Data before error: {saved_data}")
+                has_existing_session = False  # Treat as if no existing session was successfully loaded
+        else:
+            logger.info(
+                f"No existing campfire log for user '{current_user.username}' for date {target_date_str}. Returning default new story state.")
+            # has_existing_session remains False (its initial value)
 
-        if not image_bytes:
-            logger.warning(f"Image bytes are empty after generation for user '{current_user.username}'.")
-            return None
-
-        gcs_client: storage.Client = request.app.state.gcs_client
-        if not gcs_client:
-            logger.error(f"GCS client not available in app state for user '{current_user.username}'.")
-            return None
-
-        image_gcs_filename = f"{uuid.uuid4()}.png"  # Assuming PNG format
-        blob_name = f"campfire_images/{current_user.username}/{image_gcs_filename}"
-        bucket = gcs_client.bucket(GCS_BUCKET_NAME)
-        blob = bucket.blob(blob_name)
-
-        # Uploading to GCS (synchronous call, run in thread)
-        await asyncio.to_thread(
-            blob.upload_from_string,
-            image_bytes,
-            content_type="image/png"  # Adjust if the format is different
-        )
-
-        logger.info(f"Campfire image '{blob_name}' uploaded to GCS for user '{current_user.username}'.")
-        return blob.public_url
-
-    except google_auth_exceptions.DefaultCredentialsError as e:
-        logger.error(f"Vertex AI Image Gen DefaultCredentialsError for user '{current_user.username}': {e}.")
-        return None
     except Exception as e:
-        logger.exception(f"Error generating or uploading image for story for user '{current_user.username}': {e}")
-        return None
+        logger.exception(
+            f"Error fetching/processing campfire log for user '{current_user.username}' for date {target_date_str}: {e}. Returning default new story state.")
+        has_existing_session = False  # Ensure it's false on any exception during fetch/processing
 
-# --- Gemini Helper Function ---
-async def generate_story_elements_with_gemini(
-    previous_story_text: str,
-    user_idea: str
-) -> GeminiStructuredResponse:
-    """
-    Generates story continuation and next user prompt using Gemini, expecting JSON output.
-    """
-    ensure_vertex_ai_initialized() # Ensure Vertex AI is ready
+    # This part is reached if doc doesn't exist OR if there was an error during fetch/parse
+    # OR if validation of existing data failed and we decided to fall through.
+    default_initial_storyteller_turn = CampfireChatTurn(
+        id=f'start_new_{target_date_str}',
+        sender='Storyteller',
+        text='The adventure begins...',
+        imageUrl=None,
+        promptForUser=initial_prompt_for_user
+    )
+    return CampfireGetResponse(
+        storyContent=initial_story_content,
+        chatTurns=[default_initial_storyteller_turn],
+        hasExistingSession=False  # Explicitly false for new/default state
+    )
 
-    safety_settings = {
+
+@firestore.async_transactional
+async def check_and_update_usage(transaction, usage_ref, current_user: auth.User):
+    usage_snapshot = await usage_ref.get(transaction=transaction)
+    current_count = 0
+    if usage_snapshot.exists: current_count = usage_snapshot.get("campfireCalls") or 0
+    logger.debug(f"User '{current_user.username}' - Today's campfire usage count before update: {current_count}")
+    apply_limit_check = current_user.email != RATE_LIMIT_BYPASS_EMAIL
+    if current_user.email == RATE_LIMIT_BYPASS_EMAIL:
+        logger.info(f"User '{current_user.username}' ({current_user.email}) bypassing rate limit check.")
+    if apply_limit_check and current_count >= CAMPFIRE_DAILY_LIMIT:
+        logger.warning(
+            f"User '{current_user.username}' exceeded daily limit of {CAMPFIRE_DAILY_LIMIT} for /campfire POST.")
+        raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                            detail=f"Daily limit of {CAMPFIRE_DAILY_LIMIT} campfire interactions exceeded. Please try again tomorrow.")
+    transaction.set(usage_ref, {"campfireCalls": firestore.Increment(1), "lastUpdated": firestore.SERVER_TIMESTAMP},
+                    merge=True)
+    logger.debug(f"User '{current_user.username}' - Incrementing campfire usage count.")
+    return current_count
+
+
+@router.post("/campfire", response_model=CampfirePostResponse)
+async def post_campfire_turn(
+        current_user: Annotated[auth.User, Depends(auth.get_current_active_user)],
+        payload: CampfirePostRequest = Body(...),
+        db: AsyncClient = Depends(get_firestore_client),
+        gcs_client: storage.Client = Depends(get_gcs_client)
+):
+    logger.info(f"User '{current_user.username}' ({current_user.email}) attempting POST /campfire")
+    ensure_vertex_ai_initialized()
+
+    # POST always operates on today's date for creating/updating story turns and usage
+    today_utc_str = datetime.now(timezone.utc).strftime('%Y-%m-%d')
+
+    usage_doc_ref = db.collection(USERS_COLLECTION).document(current_user.username) \
+        .collection(USAGE_SUBCOLLECTION).document(today_utc_str)  # Usage is always for today
+    try:
+        await check_and_update_usage(db.transaction(), usage_doc_ref, current_user)
+    except HTTPException as http_exc:
+        raise http_exc
+    except Exception as e:
+        logger.exception(
+            f"Firestore error during usage check/update for user '{current_user.username}' on {today_utc_str}: {e}")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Could not verify usage limit.")
+
+    try:
+        gemini_text_model = GenerativeModel(TEXT_GEN_MODEL_NAME_CONFIG)
+        image_gen_model = ImageGenerationModel.from_pretrained(IMAGE_GEN_MODEL_NAME_CONFIG)
+    except Exception as e:
+        logger.exception(f"Failed to initialize AI models for user '{current_user.username}': {e}")
+        raise HTTPException(status_code=500, detail="AI model initialization failed.")
+
+    safety_settings_text = {
         HarmCategory.HARM_CATEGORY_HARASSMENT: SafetySetting.HarmBlockThreshold.BLOCK_NONE,
         HarmCategory.HARM_CATEGORY_HATE_SPEECH: SafetySetting.HarmBlockThreshold.BLOCK_NONE,
         HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT: SafetySetting.HarmBlockThreshold.BLOCK_NONE,
         HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: SafetySetting.HarmBlockThreshold.BLOCK_NONE,
     }
-    # Configure generation parameters
-    generation_config = GenerationConfig(
-        temperature=0.8, # Controls randomness (creativity)
-        top_p=0.95,      # Controls nucleus sampling
-        max_output_tokens=1000, # Max length of response
-        response_mime_type="application/json" # Explicitly request JSON
+    generation_config_text = GenerationConfig(
+        temperature=0.8, top_p=0.95, max_output_tokens=1000, response_mime_type="application/json"
     )
 
-    # Initialize the Gemini model
-    model = GenerativeModel(GEMINI_MODEL_NAME)
+    storyteller_texts = [turn.text for turn in payload.chatTurns if turn.sender == "Storyteller" and turn.text]
+    storyteller_only_previous_text = "\n\n".join(storyteller_texts)
 
-    # Construct the prompt with few-shot examples and JSON instructions
-    prompt = f"""You are a creative storyteller helping to write a collaborative children's fairy tale or an elementary school-aged myth.
-Your task is to continue the story based on the "Previous Story" and the "User's Idea".
-You must also suggest a "nextUserPrompt" to ask the user what should happen next.
-Your response MUST be a valid JSON object with two keys: "storyContinuation" and "nextUserPrompt".
-The "storyContinuation" should be a few engaging sentences (2-4 sentences) in a style suitable for young children, continuing the narrative.
-The "nextUserPrompt" should be a question to the user, guiding them to provide the next story beat.
-
-Example 1:
-Previous Story:
-The little squirrel, Squeaky, had found a shiny, mysterious nut. It was glowing with a faint blue light!
-User's Idea:
-Squeaky should try to open the nut.
-Your JSON Response:
-```json
-{{
-  "storyContinuation": "Squeaky tapped the glowing nut gently with a tiny pebble. Crack! A tiny wisp of sparkling dust puffed out, and the nut opened to reveal a miniature map, showing a path to the legendary Whispering Waterfall! \\"Wow!\\" chirped Squeaky, his eyes wide with wonder.",
-  "nextUserPrompt": "What does Squeaky decide to do with the map to the Whispering Waterfall?"
-}}
-```
-
-Example 2:
-Previous Story:
-A brave knight named Sir Reginald was riding through a dark forest. He heard a strange sound.
-User's Idea:
-Sir Reginald should investigate the sound, which is a dragon snoring.
-Your JSON Response:
-```json
-{{
-  "storyContinuation": "Sir Reginald, always brave, tiptoed towards the rumbling sound. Peeking behind a giant oak tree, he saw a HUGE green dragon, fast asleep and snoring so loudly that the leaves on the trees trembled! Sir Reginald gulped, then decided this dragon looked more sleepy than scary.",
-  "nextUserPrompt": "Does Sir Reginald try to talk to the sleepy dragon, or sneak past it?"
-}}
-```
-
---- Current Story ---
-Previous Story:
-{previous_story_text}
-
-User's Idea:
-{user_idea}
-
-Your JSON Response:
-"""
-    try:
-        logger.debug(f"Sending prompt to Gemini for JSON response: {prompt[:500]}...")
-        # Generate content asynchronously
-        response = await model.generate_content_async(
-            prompt,
-            generation_config=generation_config,
-            safety_settings=safety_settings
-        )
-
-        # Process the response
-        if response.candidates and response.candidates[0].content.parts:
-            json_text = response.candidates[0].content.parts[0].text
-            logger.info("Received JSON response from Gemini.")
-            logger.debug(f"Gemini JSON text: {json_text}")
-            try:
-                # Clean potential markdown code block formatting
-                if json_text.strip().startswith("```json"):
-                    json_text = json_text.strip()[7:]
-                    if json_text.endswith("```"):
-                        json_text = json_text[:-3]
-
-                # Parse and validate the JSON response using the Pydantic model
-                data = json.loads(json_text)
-                return GeminiStructuredResponse(**data)
-            except json.JSONDecodeError as e:
-                logger.error(f"Failed to parse JSON from Gemini: {e}. Response text: {json_text}")
-                raise HTTPException(status_code=500, detail="Story generator returned an invalid format.")
-            except ValidationError as e: # Catch Pydantic validation errors
-                logger.error(f"Failed to validate Gemini response structure: {e}. Data: {json_text}")
-                raise HTTPException(status_code=500, detail="Story generator response structure mismatch.")
-        else:
-            # Handle cases where the response is empty or blocked
-            logger.warning("Gemini response was empty or malformed for structured JSON.")
-            if response.candidates and response.candidates[0].finish_reason:
-                 logger.warning(f"Gemini finish reason: {response.candidates[0].finish_reason.name}")
-            if response.prompt_feedback and response.prompt_feedback.block_reason:
-                logger.warning(f"Gemini prompt blocked. Reason: {response.prompt_feedback.block_reason.name}")
-                raise HTTPException(status_code=400, detail=f"Story generation blocked by content policy: {response.prompt_feedback.block_reason.name}")
-            raise HTTPException(status_code=500, detail="Story generator failed to provide a response.")
-
-    except HTTPException as http_exc: # Re-raise specific HTTP exceptions
-        raise http_exc
-    except Exception as e:
-        logger.exception(f"Error calling Gemini API for structured response: {e}")
-        raise HTTPException(status_code=500, detail="Failed to communicate with the story generator.")
-
-# --- Campfire Endpoint ---
-@router.get("/campfire", response_model=CampfireGetResponse)
-async def get_campfire_start(
-    current_user: Annotated[auth.User, Depends(auth.get_current_active_user)],
-    db: AsyncClient = Depends(get_firestore_client) # Added Firestore client dependency
-):
-    """
-    Provides the initial state for the campfire story.
-    If a story for today already exists for the user, it returns that story and sets hasActiveSessionToday to True.
-    Otherwise, returns default state with hasActiveSessionToday set to False.
-    Requires authentication.
-    """
-    logger.info(f"User '{current_user.username}' accessed GET /campfire")
-
-    today_utc_str = datetime.now(timezone.utc).strftime('%Y-%m-%d')
-    # Path to the user's campfire log for today
-    campfire_log_ref = db.collection(USERS_COLLECTION).document(current_user.username) \
-                         .collection(CAMPFIRES_SUBCOLLECTION).document(today_utc_str)
-
-    has_active_session = False # Initialize flag
-
-    try:
-        # Attempt to get today's campfire log
-        doc = await campfire_log_ref.get()
-        if doc.exists:
-            logger.info(f"Found existing campfire log for user '{current_user.username}' for date {today_utc_str}.")
-            saved_data = doc.to_dict()
-            has_active_session = True # Set flag to True as session exists
-            try:
-                # Spread saved_data and add/overwrite hasActiveSessionToday
-                return CampfireGetResponse(**saved_data, hasActiveSessionToday=has_active_session)
-            except ValidationError as e:
-                logger.error(f"Validation error when creating CampfireGetResponse from saved data for user {current_user.username}: {e}. Data: {saved_data}")
-                # Fallback to default if saved data is malformed, but still indicate no *valid* active session was loaded
-                has_active_session = False # Reset if validation fails for loaded data
-        else:
-            logger.info(f"No existing campfire log for user '{current_user.username}' for date {today_utc_str}. Returning default.")
-            # has_active_session remains False
-    except Exception as e:
-        logger.exception(f"Error fetching campfire log for user '{current_user.username}' for date {today_utc_str}: {e}. Returning default.")
-        # has_active_session remains False
-
-    # Return the default starting point of the story if no log found or error occurred
-    return CampfireGetResponse(
-        storyContent="The campfire crackles, waiting for a tale...",
-        prompt="How does the story begin?",
-        chatTurns=[
-            CampfireChatTurn(id='start', sender='Storyteller', text='The adventure begins...')
-        ],
-        newImageUrl="https://storage.googleapis.com/example-bucket/campfire_start.jpg", # Placeholder image
-        hasActiveSessionToday=has_active_session # Use the determined flag
+    prompt_for_story = build_story_generation_prompt(
+        previous_story_text=storyteller_only_previous_text,
+        user_idea=payload.inputText
     )
 
-@firestore.async_transactional
-async def check_and_update_usage(transaction, usage_ref, current_user: auth.User):
-    """
-    Firestore transaction to check usage limit (with bypass) and update the count.
-    """
-    usage_snapshot = await usage_ref.get(transaction=transaction)
-    current_count = 0
-    if usage_snapshot.exists:
-        current_count = usage_snapshot.get("campfireCalls") or 0
-
-    logger.debug(f"User '{current_user.username}' - Today's campfire usage count before update: {current_count}")
-
-    # Check if rate limit should be applied (bypass for specific email)
-    apply_limit_check = True
-    if current_user.email == RATE_LIMIT_BYPASS_EMAIL:
-        apply_limit_check = False
-        logger.info(f"User '{current_user.username}' ({current_user.email}) bypassing rate limit check.")
-
-    # If limit applies and is exceeded, raise 429 error
-    if apply_limit_check and current_count >= CAMPFIRE_DAILY_LIMIT:
-        logger.warning(f"User '{current_user.username}' exceeded daily limit of {CAMPFIRE_DAILY_LIMIT} for /campfire POST.")
-        raise HTTPException(
-            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-            detail=f"Daily limit of {CAMPFIRE_DAILY_LIMIT} campfire interactions exceeded. Please try again tomorrow."
-        )
-
-    # Increment usage count atomically for all users (even bypassed ones)
-    transaction.set(usage_ref, {
-        "campfireCalls": firestore.Increment(1),
-        "lastUpdated": firestore.SERVER_TIMESTAMP # Record update time
-    }, merge=True) # Use merge=True to create or update
-    logger.debug(f"User '{current_user.username}' - Incrementing campfire usage count.")
-    return current_count # Return count *before* increment
-
-@router.post("/campfire", response_model=CampfirePostResponse)
-async def post_campfire_turn(
-    current_user: Annotated[auth.User, Depends(auth.get_current_active_user)],
-    payload: CampfirePostRequest = Body(...),
-    request: Request = Request,  # Added Request to access app.state.gcs_client
-    db: AsyncClient = Depends(get_firestore_client)
-):
-    """
-    Processes a user's turn in the story, generates a new image based on the story,
-    saves the response, and returns the next state.
-    Requires authentication and enforces a daily usage limit (with bypass).
-    Manages chat turn history by appending new turns.
-    """
-    logger.info(f"User '{current_user.username}' ({current_user.email}) attempting POST /campfire")
-
-    today_utc_str = datetime.now(timezone.utc).strftime('%Y-%m-%d')
-    usage_doc_ref = db.collection(USERS_COLLECTION).document(current_user.username) \
-                      .collection(USAGE_SUBCOLLECTION).document(today_utc_str)
+    gemini_story_data: GeminiStructuredResponse
     try:
-        await check_and_update_usage(db.transaction(), usage_doc_ref, current_user) # check_and_update_usage is defined elsewhere in your file
-        logger.info(f"User '{current_user.username}' usage count updated for {today_utc_str}.")
-    except HTTPException as http_exc:
-        raise http_exc # Re-raise HTTP exceptions like 429
-    except Exception as e:
-        logger.exception(f"Firestore error during usage check/update for user '{current_user.username}' on {today_utc_str}: {e}")
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Could not verify usage limit.")
-
-    logger.debug(f"User '{current_user.username}' passed rate limit check. Generating story elements with Gemini.")
-
-    gemini_response: GeminiStructuredResponse
-    try:
-        # First call to Gemini for story text and next prompt
-        gemini_response = await generate_story_elements_with_gemini( # generate_story_elements_with_gemini is defined elsewhere
-            payload.previousContent,
-            payload.inputText
+        gemini_story_data = await generate_story_from_prompt(
+            gemini_text_model=gemini_text_model, prompt=prompt_for_story,
+            generation_config=generation_config_text, safety_settings=safety_settings_text
         )
-    except HTTPException as e: # Re-raise specific HTTP exceptions from Gemini helper
+    except HTTPException as e:
         raise e
-    except Exception as e: # Catch any other unexpected errors
-        logger.exception(f"Unexpected error during Gemini story text generation for user '{current_user.username}': {e}")
+    except Exception as e:
+        logger.exception(f"Unexpected error from generate_story_from_prompt for user '{current_user.username}': {e}")
         raise HTTPException(status_code=500, detail="Failed to generate story elements.")
 
-    full_story_content = f"{payload.previousContent}\n\n{gemini_response.storyContinuation}"
-    next_user_prompt = gemini_response.nextUserPrompt
+    story_parts_for_response = []
+    if payload.previousContent and payload.previousContent != "The campfire crackles, waiting for a tale...":
+        story_parts_for_response.append(payload.previousContent)
+
+    story_parts_for_response.append(payload.inputText)
+    story_parts_for_response.append(gemini_story_data.storyContinuation)
+    full_story_content = "\n\n".join(filter(None, story_parts_for_response))
+
+    if not full_story_content and \
+            (
+                    payload.previousContent == "The campfire crackles, waiting for a tale..." or not payload.previousContent) and \
+            (payload.inputText or gemini_story_data.storyContinuation):
+        full_story_content = "\n\n".join(filter(None, [payload.inputText, gemini_story_data.storyContinuation]))
 
     updated_chat_turns = list(payload.chatTurns)
     updated_chat_turns.append(
-        CampfireChatTurn(sender='User', text=payload.inputText)
-    )
-    updated_chat_turns.append(
-        CampfireChatTurn(sender='Storyteller', text=gemini_response.storyContinuation)
+        CampfireChatTurn(sender='User', text=payload.inputText, imageUrl=None, promptForUser=None)
     )
 
-    # --- Second call to Vertex AI to generate an image ---
-    new_image_url: Optional[str] = None
-    if gemini_response.storyContinuation: # Only generate image if there's new story content
+    storyteller_turn_image_url: Optional[str] = None
+    if gemini_story_data.storyContinuation:
+        current_segment_for_image = gemini_story_data.storyContinuation
+        previous_context_parts_for_image = []
+        if payload.previousContent and payload.previousContent != "The campfire crackles, waiting for a tale...":
+            previous_context_parts_for_image.append(payload.previousContent)
+        if payload.inputText:
+            previous_context_parts_for_image.append(payload.inputText)
+        full_story_context_for_image = "\n\n".join(filter(None, previous_context_parts_for_image))
+        if not full_story_context_for_image:
+            full_story_context_for_image = "The story is just beginning."
+
         try:
-            logger.info(f"Requesting image generation for story continuation for user '{current_user.username}'.")
-            new_image_url = await generate_image_for_story(
-                prompt_text=gemini_response.storyContinuation,
-                request=request, # Pass the FastAPI request object
-                current_user=current_user
+            storyteller_turn_image_url = await generate_and_upload_image(
+                image_gen_model=image_gen_model, gcs_client=gcs_client,
+                gcs_bucket_name=GCS_BUCKET_NAME_CONFIG,
+                current_story_segment=current_segment_for_image,
+                full_story_context=full_story_context_for_image,
+                username=current_user.username
             )
-            if new_image_url:
-                logger.info(f"Successfully generated image URL: {new_image_url} for user '{current_user.username}'.")
+            if storyteller_turn_image_url:
+                logger.info(
+                    f"Successfully generated image URL: {storyteller_turn_image_url} for user '{current_user.username}'.")
             else:
-                logger.warning(f"Image generation did not return a URL for user '{current_user.username}'.")
+                logger.warning(f"Image generation utility returned no URL for user '{current_user.username}'.")
         except Exception as img_gen_exc:
-            logger.exception(f"Error during image generation or upload for user '{current_user.username}': {img_gen_exc}")
-            # Decide if this should be a fatal error or if the flow can continue without an image.
-            # For now, it continues, and new_image_url will remain None.
+            logger.exception(
+                f"Error calling image generation utility for user '{current_user.username}': {img_gen_exc}")
+
+    updated_chat_turns.append(
+        CampfireChatTurn(
+            sender='Storyteller', text=gemini_story_data.storyContinuation,
+            imageUrl=storyteller_turn_image_url, promptForUser=gemini_story_data.nextUserPrompt
+        )
+    )
 
     response_data = CampfirePostResponse(
         storyContent=full_story_content,
-        prompt=next_user_prompt,
-        chatTurns=updated_chat_turns,
-        newImageUrl=new_image_url  # Use the dynamically generated image URL
+        chatTurns=updated_chat_turns
     )
 
-    # Save the complete response (including the new image URL) to Firestore
     try:
-        campfire_log_ref = db.collection(USERS_COLLECTION).document(current_user.username) \
-                             .collection(CAMPFIRES_SUBCOLLECTION).document(today_utc_str)
-        data_to_save = response_data.model_dump(mode='json') # Get dict from Pydantic model
-        data_to_save['savedAt'] = firestore.SERVER_TIMESTAMP # Add a server timestamp
-        await campfire_log_ref.set(data_to_save)
-        logger.info(f"Saved campfire response (with image URL if any) for user '{current_user.username}' for date {today_utc_str}.")
+        # POST always saves to today's date log
+        campfire_log_ref_post = db.collection(USERS_COLLECTION).document(current_user.username) \
+            .collection(CAMPFIRES_SUBCOLLECTION).document(today_utc_str)
+        data_to_save = response_data.model_dump(mode='json')
+        data_to_save['savedAt'] = firestore.SERVER_TIMESTAMP
+        await campfire_log_ref_post.set(data_to_save)  # Use set to overwrite today's log with the latest state
+        logger.info(f"Saved/Updated campfire response for user '{current_user.username}' for date {today_utc_str}.")
     except Exception as e:
-        logger.exception(f"Failed to save campfire response for user '{current_user.username}' for date {today_utc_str}: {e}")
-        # Not raising an HTTP error here, as the core operation (story gen) succeeded.
+        logger.exception(
+            f"Failed to save campfire response for user '{current_user.username}' for date {today_utc_str}: {e}")
 
     return response_data
-

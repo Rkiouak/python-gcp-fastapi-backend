@@ -1,13 +1,13 @@
 import uuid
 import logging
-from typing import List, Optional, Union, Annotated
-from datetime import datetime, timezone  # Ensure timezone is imported
+from typing import List, Optional, Union, Annotated, Set  # Added Set
+from datetime import datetime, timezone
 import asyncio
 
-from fastapi import APIRouter, HTTPException, Body, Depends, Request, status, Query  # Added Query
+from fastapi import APIRouter, HTTPException, Body, Depends, Request, status, Query
 from pydantic import BaseModel, Field, ValidationError
 from google.cloud import firestore
-from google.cloud.firestore import AsyncClient
+from google.cloud.firestore import AsyncClient, FieldFilter  # Added FieldFilter
 from google.cloud import storage
 
 import vertexai
@@ -27,7 +27,7 @@ from services.ai_story_utils import (
 logger = logging.getLogger('uvicorn.error')
 
 IMAGE_GEN_MODEL_NAME_CONFIG = "imagen-3.0-generate-002"
-TEXT_GEN_MODEL_NAME_CONFIG = "gemini-2.0-flash"
+TEXT_GEN_MODEL_NAME_CONFIG = "gemini-2.5-flash-preview-04-17"  # Or your preferred/available model
 GCS_BUCKET_NAME_CONFIG = "musings-mr.net"
 GCP_PROJECT_ID = "clojure-gen-blog"
 GCP_LOCATION = "us-central1"
@@ -75,7 +75,8 @@ router = APIRouter(
     dependencies=[Depends(auth.get_current_active_user)],
 )
 
-CAMPFIRE_DAILY_LIMIT = 5
+CAMPFIRE_DAILY_LIMIT = 50
+MAX_CAMPFIRE_STORIES = 25  # Maximum number of stories a user can save
 USERS_COLLECTION = "users"
 USAGE_SUBCOLLECTION = "usage"
 CAMPFIRES_SUBCOLLECTION = "campfires"
@@ -93,85 +94,86 @@ class CampfireChatTurn(BaseModel):
 class CampfireGetResponse(BaseModel):
     storyContent: str
     chatTurns: List[CampfireChatTurn]
-    hasExistingSession: bool  # MODIFIED: Renamed from hasActiveSessionToday
+    storyTitle: Optional[str] = None
+    hasExistingSession: bool
 
 
 class CampfirePostRequest(BaseModel):
     previousContent: str
     inputText: str
     chatTurns: List[CampfireChatTurn] = Field(default_factory=list)
+    storyTitle: Optional[str] = None  # User-provided title for the story
 
 
 class CampfirePostResponse(BaseModel):
     storyContent: str
     chatTurns: List[CampfireChatTurn]
+    storyTitle: str  # The title under which the story was saved/updated
 
 
-class CampfireDateListResponse(BaseModel):
-    dates: List[str] = Field(
-        description="A list of dates (YYYY-MM-DD) for which campfire stories exist, sorted descending.")
+class CampfireStoryListResponse(BaseModel):
+    titles: List[str] = Field(
+        description="A list of unique story titles for which campfire stories exist, sorted alphabetically.")
 
 
-@router.get("/campfire/list", response_model=CampfireDateListResponse)
-async def list_campfire_story_dates(
+@router.get("/campfire/list", response_model=CampfireStoryListResponse)
+async def list_campfire_story_titles(
         current_user: Annotated[auth.User, Depends(auth.get_current_active_user)],
         db: AsyncClient = Depends(get_firestore_client)
 ):
-    logger.info(f"User '{current_user.username}' requesting list of their campfire story dates.")
-    story_dates = []
+    logger.info(f"User '{current_user.username}' requesting list of their campfire story titles.")
+    story_titles_set: Set[str] = set()
     try:
         campfires_collection_ref = db.collection(USERS_COLLECTION) \
             .document(current_user.username) \
             .collection(CAMPFIRES_SUBCOLLECTION)
-        async for doc_snapshot in campfires_collection_ref.select([]).stream():
-            story_dates.append(doc_snapshot.id)
-        story_dates.sort(reverse=True)
-        logger.info(f"Found {len(story_dates)} campfire story dates for user '{current_user.username}'.")
-        return CampfireDateListResponse(dates=story_dates)
+
+        # Fetch only the 'storyTitle' field if possible, or stream docs and extract
+        # Using .select(["storyTitle"]) might be more efficient if supported and only title is needed.
+        # For simplicity here, we stream the document and extract.
+        async for doc_snapshot in campfires_collection_ref.stream():
+            data = doc_snapshot.to_dict()
+            if data and "storyTitle" in data and data["storyTitle"]:
+                story_titles_set.add(data["storyTitle"])
+
+        sorted_titles = sorted(list(story_titles_set))
+        logger.info(f"Found {len(sorted_titles)} unique campfire story titles for user '{current_user.username}'.")
+        return CampfireStoryListResponse(titles=sorted_titles)
     except Exception as e:
-        logger.exception(f"Error listing campfire story dates for user '{current_user.username}': {e}")
-        raise HTTPException(status_code=500, detail="Failed to retrieve story dates list.")
+        logger.exception(f"Error listing campfire story titles for user '{current_user.username}': {e}")
+        raise HTTPException(status_code=500, detail="Failed to retrieve story titles list.")
 
 
 @router.get("/campfire", response_model=CampfireGetResponse)
 async def get_campfire_start(
         current_user: Annotated[auth.User, Depends(auth.get_current_active_user)],
         db: AsyncClient = Depends(get_firestore_client),
-        date: Optional[str] = Query(None,
-                                    description="Optional date in YYYY-MM-DD format to fetch a specific campfire story. Defaults to today's date.",
-                                    alias="date_str")  # MODIFIED: Added query param
+        storyTitle: Optional[str] = Query(None,
+                                          description="Optional title of the campfire story to fetch.",
+                                          alias="title")
 ):
-    logger.info(f"User '{current_user.username}' requesting campfire story. Provided date_str: '{date}'.")
+    logger.info(f"User '{current_user.username}' requesting campfire story. Provided title: '{storyTitle}'.")
 
-    target_date_str: str
-    if date:
-        try:
-            # Validate YYYY-MM-DD format. strptime raises ValueError if format doesn't match.
-            datetime.strptime(date, "%Y-%m-%d")
-            target_date_str = date
-            logger.info(f"Using provided date: {target_date_str} for user '{current_user.username}'.")
-        except ValueError:
-            logger.warning(f"Invalid date format '{date}' provided by user '{current_user.username}'.")
-            raise HTTPException(status_code=400, detail="Invalid date format. Please use YYYY-MM-DD.")
-    else:
-        # Default to today's date in UTC
-        target_date_str = datetime.now(timezone.utc).strftime('%Y-%m-%d')
-        logger.info(f"Defaulting to today's date: {target_date_str} for user '{current_user.username}'.")
-
-    campfire_log_ref = db.collection(USERS_COLLECTION) \
-        .document(current_user.username) \
-        .collection(CAMPFIRES_SUBCOLLECTION).document(target_date_str)
-
-    has_existing_session = False
     initial_prompt_for_user = "How does the story begin?"
     initial_story_content = "The campfire crackles, waiting for a tale..."
+    has_existing_session = False
+    loaded_story_title = storyTitle  # Will be updated if a story is loaded
 
-    try:
-        doc = await campfire_log_ref.get()
-        if doc.exists:
-            logger.info(f"Found existing campfire log for user '{current_user.username}' for date {target_date_str}.")
+    if storyTitle:
+        campfires_collection_ref = db.collection(USERS_COLLECTION) \
+            .document(current_user.username) \
+            .collection(CAMPFIRES_SUBCOLLECTION)
+
+        query = campfires_collection_ref.where(filter=FieldFilter("storyTitle", "==", storyTitle)).limit(1)
+        docs_stream = query.stream()
+        doc_list = [doc async for doc in docs_stream]
+
+        if doc_list:
+            doc = doc_list[0]
+            logger.info(
+                f"Found existing campfire log for user '{current_user.username}' with storyTitle '{storyTitle}'. Doc ID: {doc.id}")
             saved_data = doc.to_dict()
-            has_existing_session = True  # Record found for the target date
+            has_existing_session = True
 
             parsed_chat_turns = []
             if "chatTurns" in saved_data and isinstance(saved_data["chatTurns"], list):
@@ -183,14 +185,12 @@ async def get_campfire_start(
                         parsed_chat_turns.append(CampfireChatTurn(**turn_data_dict))
                     except ValidationError as ve:
                         logger.error(
-                            f"Validation error for a GET chat turn (date: {target_date_str}): {ve}. Data: {turn_data_dict}")
+                            f"Validation error for a GET chat turn (storyTitle: {storyTitle}): {ve}. Data: {turn_data_dict}")
                 saved_data["chatTurns"] = parsed_chat_turns
 
             if not saved_data.get("chatTurns"):
-                logger.warning(
-                    f"Chat turns empty/malformed for user {current_user.username}, date {target_date_str}. Initializing.")
-                first_turn = CampfireChatTurn(id=f'start_error_get_{target_date_str}', sender='Storyteller',
-                                              text='The adventure begins (or had an issue loading)!', imageUrl=None,
+                first_turn = CampfireChatTurn(id=str(uuid.uuid4()), sender='Storyteller',
+                                              text='The adventure loaded (or had an issue with turns)!', imageUrl=None,
                                               promptForUser=initial_prompt_for_user)
                 saved_data["chatTurns"] = [first_turn]
 
@@ -200,45 +200,22 @@ async def get_campfire_start(
                     story_parts = [turn.text for turn in parsed_chat_turns if turn.text]
                     if story_parts: saved_data["storyContent"] = "\n\n".join(story_parts)
 
-            try:
-                # Remove fields not in response model to prevent validation error from old data
-                keys_to_pop = ["newImageUrl", "prompt", "savedAt", "hasActiveSessionToday"]
-                for key_to_pop in keys_to_pop:
-                    saved_data.pop(key_to_pop, None)
+            loaded_story_title = saved_data.get("storyTitle", storyTitle)  # Use title from doc
 
-                # Ensure required fields for CampfireGetResponse are present
-                final_story_content = saved_data.get("storyContent", initial_story_content)
-                final_chat_turns = saved_data.get("chatTurns", [])
-                if not final_chat_turns:  # If somehow still empty, provide a default
-                    final_chat_turns = [CampfireChatTurn(id=f'default_final_{target_date_str}', sender='Storyteller',
-                                                         text='Welcome to the campfire!', imageUrl=None,
-                                                         promptForUser=initial_prompt_for_user)]
-                    if final_story_content == initial_story_content:  # And if story content is also placeholder
-                        final_story_content = 'Welcome to the campfire!'
-
-                return CampfireGetResponse(
-                    storyContent=final_story_content,
-                    chatTurns=final_chat_turns,
-                    hasExistingSession=has_existing_session  # This is True here
-                )
-            except ValidationError as e:
-                logger.error(
-                    f"Final validation error for CampfireGetResponse from saved data (date: {target_date_str}) for user {current_user.username}: {e}. Data before error: {saved_data}")
-                has_existing_session = False  # Treat as if no existing session was successfully loaded
+            return CampfireGetResponse(
+                storyContent=saved_data.get("storyContent", initial_story_content),
+                chatTurns=saved_data.get("chatTurns", []),
+                storyTitle=loaded_story_title,
+                hasExistingSession=has_existing_session
+            )
         else:
             logger.info(
-                f"No existing campfire log for user '{current_user.username}' for date {target_date_str}. Returning default new story state.")
-            # has_existing_session remains False (its initial value)
+                f"No campfire log found for user '{current_user.username}' with storyTitle '{storyTitle}'. Returning default new story state.")
+    else:
+        logger.info(f"No storyTitle provided by user '{current_user.username}'. Returning default new story state.")
 
-    except Exception as e:
-        logger.exception(
-            f"Error fetching/processing campfire log for user '{current_user.username}' for date {target_date_str}: {e}. Returning default new story state.")
-        has_existing_session = False  # Ensure it's false on any exception during fetch/processing
-
-    # This part is reached if doc doesn't exist OR if there was an error during fetch/parse
-    # OR if validation of existing data failed and we decided to fall through.
     default_initial_storyteller_turn = CampfireChatTurn(
-        id=f'start_new_{target_date_str}',
+        id=str(uuid.uuid4()),
         sender='Storyteller',
         text='The adventure begins...',
         imageUrl=None,
@@ -247,7 +224,8 @@ async def get_campfire_start(
     return CampfireGetResponse(
         storyContent=initial_story_content,
         chatTurns=[default_initial_storyteller_turn],
-        hasExistingSession=False  # Explicitly false for new/default state
+        storyTitle=None,
+        hasExistingSession=False
     )
 
 
@@ -257,17 +235,20 @@ async def check_and_update_usage(transaction, usage_ref, current_user: auth.User
     current_count = 0
     if usage_snapshot.exists: current_count = usage_snapshot.get("campfireCalls") or 0
     logger.debug(f"User '{current_user.username}' - Today's campfire usage count before update: {current_count}")
-    apply_limit_check = current_user.email != RATE_LIMIT_BYPASS_EMAIL
+
+    apply_daily_limit_check = current_user.email != RATE_LIMIT_BYPASS_EMAIL
     if current_user.email == RATE_LIMIT_BYPASS_EMAIL:
-        logger.info(f"User '{current_user.username}' ({current_user.email}) bypassing rate limit check.")
-    if apply_limit_check and current_count >= CAMPFIRE_DAILY_LIMIT:
+        logger.info(f"User '{current_user.username}' ({current_user.email}) bypassing daily API call limit check.")
+
+    if apply_daily_limit_check and current_count >= CAMPFIRE_DAILY_LIMIT:
         logger.warning(
-            f"User '{current_user.username}' exceeded daily limit of {CAMPFIRE_DAILY_LIMIT} for /campfire POST.")
+            f"User '{current_user.username}' exceeded daily API call limit of {CAMPFIRE_DAILY_LIMIT} for /campfire POST.")
         raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS,
                             detail=f"Daily limit of {CAMPFIRE_DAILY_LIMIT} campfire interactions exceeded. Please try again tomorrow.")
+
     transaction.set(usage_ref, {"campfireCalls": firestore.Increment(1), "lastUpdated": firestore.SERVER_TIMESTAMP},
                     merge=True)
-    logger.debug(f"User '{current_user.username}' - Incrementing campfire usage count.")
+    logger.debug(f"User '{current_user.username}' - Incrementing daily campfire API call usage count.")
     return current_count
 
 
@@ -278,22 +259,65 @@ async def post_campfire_turn(
         db: AsyncClient = Depends(get_firestore_client),
         gcs_client: storage.Client = Depends(get_gcs_client)
 ):
-    logger.info(f"User '{current_user.username}' ({current_user.email}) attempting POST /campfire")
-    ensure_vertex_ai_initialized()
+    logger.info(
+        f"User '{current_user.username}' ({current_user.email}) attempting POST /campfire with payload storyTitle: '{payload.storyTitle}'")
 
-    # POST always operates on today's date for creating/updating story turns and usage
-    today_utc_str = datetime.now(timezone.utc).strftime('%Y-%m-%d')
+    story_title_to_save: str
+    today_utc_str_for_default_title = datetime.now(timezone.utc).strftime('%Y-%m-%d')
+    if payload.storyTitle and payload.storyTitle.strip():
+        story_title_to_save = payload.storyTitle.strip()
+    else:
+        story_title_to_save = f"Untitled Story - {today_utc_str_for_default_title}"
+    logger.info(f"User '{current_user.username}' - Effective story_title_to_save: '{story_title_to_save}'")
 
+    campfires_collection_ref = db.collection(USERS_COLLECTION).document(current_user.username) \
+        .collection(CAMPFIRES_SUBCOLLECTION)
+
+    query_existing_by_title = campfires_collection_ref.where(
+        filter=FieldFilter("storyTitle", "==", story_title_to_save)).limit(1)
+    existing_docs_stream = query_existing_by_title.stream()
+    existing_doc_list = [doc async for doc in existing_docs_stream]
+
+    if not existing_doc_list:  # This implies a new story creation attempt
+        if current_user.email != RATE_LIMIT_BYPASS_EMAIL:
+            count_query = campfires_collection_ref.count()
+            aggregation_query_result = await count_query.get()
+            current_story_count = 0
+            if aggregation_query_result and aggregation_query_result[0] and hasattr(aggregation_query_result[0][0],
+                                                                                    'value'):
+                current_story_count = aggregation_query_result[0][0].value
+            else:
+                logger.warning(
+                    f"Could not retrieve accurate story count for user {current_user.username}. Check Firestore logs/permissions.")
+
+            logger.info(
+                f"User '{current_user.username}' has {current_story_count} existing campfire stories. Limit is {MAX_CAMPFIRE_STORIES}.")
+
+            if current_story_count >= MAX_CAMPFIRE_STORIES:
+                logger.warning(
+                    f"User '{current_user.username}' has reached the maximum story limit of {MAX_CAMPFIRE_STORIES}.")
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail=f"You have reached the maximum limit of {MAX_CAMPFIRE_STORIES} stories. Please delete an existing story to create a new one."
+                )
+        else:
+            logger.info(
+                f"User '{current_user.username}' ({current_user.email}) bypassing total story limit check for new story creation.")
+
+    ensure_vertex_ai_initialized()  # Initialize AI after passing story limit checks for new stories
+
+    today_utc_str_for_usage = datetime.now(timezone.utc).strftime('%Y-%m-%d')
     usage_doc_ref = db.collection(USERS_COLLECTION).document(current_user.username) \
-        .collection(USAGE_SUBCOLLECTION).document(today_utc_str)  # Usage is always for today
+        .collection(USAGE_SUBCOLLECTION).document(today_utc_str_for_usage)
     try:
         await check_and_update_usage(db.transaction(), usage_doc_ref, current_user)
     except HTTPException as http_exc:
         raise http_exc
     except Exception as e:
         logger.exception(
-            f"Firestore error during usage check/update for user '{current_user.username}' on {today_utc_str}: {e}")
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Could not verify usage limit.")
+            f"Firestore error during daily usage check/update for user '{current_user.username}' on {today_utc_str_for_usage}: {e}")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                            detail="Could not verify daily usage limit.")
 
     try:
         gemini_text_model = GenerativeModel(TEXT_GEN_MODEL_NAME_CONFIG)
@@ -311,15 +335,11 @@ async def post_campfire_turn(
     generation_config_text = GenerationConfig(
         temperature=0.8, top_p=0.95, max_output_tokens=1000, response_mime_type="application/json"
     )
-
     storyteller_texts = [turn.text for turn in payload.chatTurns if turn.sender == "Storyteller" and turn.text]
     storyteller_only_previous_text = "\n\n".join(storyteller_texts)
-
     prompt_for_story = build_story_generation_prompt(
-        previous_story_text=storyteller_only_previous_text,
-        user_idea=payload.inputText
+        previous_story_text=storyteller_only_previous_text, user_idea=payload.inputText
     )
-
     gemini_story_data: GeminiStructuredResponse
     try:
         gemini_story_data = await generate_story_from_prompt(
@@ -335,11 +355,9 @@ async def post_campfire_turn(
     story_parts_for_response = []
     if payload.previousContent and payload.previousContent != "The campfire crackles, waiting for a tale...":
         story_parts_for_response.append(payload.previousContent)
-
     story_parts_for_response.append(payload.inputText)
     story_parts_for_response.append(gemini_story_data.storyContinuation)
     full_story_content = "\n\n".join(filter(None, story_parts_for_response))
-
     if not full_story_content and \
             (
                     payload.previousContent == "The campfire crackles, waiting for a tale..." or not payload.previousContent) and \
@@ -350,7 +368,6 @@ async def post_campfire_turn(
     updated_chat_turns.append(
         CampfireChatTurn(sender='User', text=payload.inputText, imageUrl=None, promptForUser=None)
     )
-
     storyteller_turn_image_url: Optional[str] = None
     if gemini_story_data.storyContinuation:
         current_segment_for_image = gemini_story_data.storyContinuation
@@ -360,9 +377,7 @@ async def post_campfire_turn(
         if payload.inputText:
             previous_context_parts_for_image.append(payload.inputText)
         full_story_context_for_image = "\n\n".join(filter(None, previous_context_parts_for_image))
-        if not full_story_context_for_image:
-            full_story_context_for_image = "The story is just beginning."
-
+        if not full_story_context_for_image: full_story_context_for_image = "The story is just beginning."
         try:
             storyteller_turn_image_url = await generate_and_upload_image(
                 image_gen_model=image_gen_model, gcs_client=gcs_client,
@@ -371,14 +386,8 @@ async def post_campfire_turn(
                 full_story_context=full_story_context_for_image,
                 username=current_user.username
             )
-            if storyteller_turn_image_url:
-                logger.info(
-                    f"Successfully generated image URL: {storyteller_turn_image_url} for user '{current_user.username}'.")
-            else:
-                logger.warning(f"Image generation utility returned no URL for user '{current_user.username}'.")
         except Exception as img_gen_exc:
-            logger.exception(
-                f"Error calling image generation utility for user '{current_user.username}': {img_gen_exc}")
+            logger.exception(f"Error in image gen for user '{current_user.username}': {img_gen_exc}")
 
     updated_chat_turns.append(
         CampfireChatTurn(
@@ -387,21 +396,43 @@ async def post_campfire_turn(
         )
     )
 
-    response_data = CampfirePostResponse(
+    response_data_model = CampfirePostResponse(
         storyContent=full_story_content,
-        chatTurns=updated_chat_turns
+        chatTurns=updated_chat_turns,
+        storyTitle=story_title_to_save
     )
 
+    campfire_doc_ref = None
+    existing_doc_id = None
+    created_at_timestamp = None
+
+    if existing_doc_list:
+        existing_doc = existing_doc_list[0]
+        existing_doc_id = existing_doc.id
+        campfire_doc_ref = campfires_collection_ref.document(existing_doc_id)
+        logger.info(f"Updating existing story with title '{story_title_to_save}', doc ID: {existing_doc_id}.")
+        existing_data = existing_doc.to_dict()
+        if existing_data and 'createdAt' in existing_data:
+            created_at_timestamp = existing_data['createdAt']
+        else:  # If createdAt missing in an old doc, set it now.
+            created_at_timestamp = firestore.SERVER_TIMESTAMP
+    else:
+        new_doc_id = str(uuid.uuid4())
+        campfire_doc_ref = campfires_collection_ref.document(new_doc_id)
+        created_at_timestamp = firestore.SERVER_TIMESTAMP
+        logger.info(f"Creating new story with title '{story_title_to_save}', new doc ID: {new_doc_id}.")
+
     try:
-        # POST always saves to today's date log
-        campfire_log_ref_post = db.collection(USERS_COLLECTION).document(current_user.username) \
-            .collection(CAMPFIRES_SUBCOLLECTION).document(today_utc_str)
-        data_to_save = response_data.model_dump(mode='json')
+        data_to_save = response_data_model.model_dump(mode='json')
+        data_to_save['storyTitle'] = story_title_to_save  # Ensure this is part of the saved data
         data_to_save['savedAt'] = firestore.SERVER_TIMESTAMP
-        await campfire_log_ref_post.set(data_to_save)  # Use set to overwrite today's log with the latest state
-        logger.info(f"Saved/Updated campfire response for user '{current_user.username}' for date {today_utc_str}.")
+        data_to_save['createdAt'] = created_at_timestamp
+
+        await campfire_doc_ref.set(data_to_save, merge=True if existing_doc_id else False)
+        logger.info(
+            f"Saved/Updated campfire response for user '{current_user.username}' with storyTitle '{story_title_to_save}' (Doc ID: {campfire_doc_ref.id}).")
     except Exception as e:
         logger.exception(
-            f"Failed to save campfire response for user '{current_user.username}' for date {today_utc_str}: {e}")
+            f"Failed to save campfire response for user '{current_user.username}' with storyTitle '{story_title_to_save}': {e}")
 
-    return response_data
+    return response_data_model

@@ -12,6 +12,7 @@ from pydantic import BaseModel, Field
 from typing import List, Optional, Annotated
 import datetime
 import uuid
+import re # Import the 're' module for regular expressions
 
 import AuthAndUser as auth
 
@@ -23,19 +24,19 @@ MAX_IMAGE_SIZE_KB = 600
 MAX_IMAGE_SIZE_BYTES = MAX_IMAGE_SIZE_KB * 1024
 MAX_TEXT_FIELD_SIZE_KB = 500
 MAX_TEXT_FIELD_SIZE_BYTES = MAX_TEXT_FIELD_SIZE_KB * 1024
+MAX_SLUG_LENGTH = 200 # Define a max length for generated slugs
 
 router = APIRouter(
     prefix="/posts",
     tags=["posts", "comments"]
 )
 
-# --- Pydantic Models ---
-
+# --- Pydantic Models (as before) ---
 class Post(BaseModel):
     id: str
     title: str
     author: str
-    date: str | datetime.date # Keep as is, Firestore stores dates as timestamps or strings
+    date: str | datetime.date
     imageUrl: Optional[str] = Field(default=None)
     snippet: str
     content: str
@@ -46,7 +47,7 @@ class PostSnippet(BaseModel):
     id: str
     title: str
     author: str
-    date: str | datetime.date # Keep as is
+    date: str | datetime.date
     snippet: str
     imageUrl: Optional[str] = Field(default=None)
     class Config:
@@ -61,20 +62,15 @@ class Comment(CommentBase):
     post_id: str
     author: str
     date: datetime.datetime = Field(default_factory=lambda: datetime.datetime.now(datetime.timezone.utc))
-
     class Config:
         from_attributes = True
-        # Ensure Pydantic can handle datetime objects correctly when creating from attributes
-        # and when serializing to JSON (though Firestore handles datetime objects natively)
 
-
-# --- Helper Functions ---
-
-async def get_firestore_client(request: Request) -> AsyncClient: # Type hint with AsyncClient
+# --- Helper Functions (get_firestore_client, get_gcs_client, upload_to_gcs as before) ---
+async def get_firestore_client(request: Request) -> AsyncClient:
     if not hasattr(request.app.state, 'db') or not request.app.state.db:
         logger.error("Firestore client not initialized or unavailable.")
         raise HTTPException(status_code=503, detail="Database service unavailable")
-    if not isinstance(request.app.state.db, AsyncClient): # Check instance type
+    if not isinstance(request.app.state.db, AsyncClient):
          logger.error("Firestore client is not an AsyncClient in posts router.")
          raise HTTPException(status_code=503, detail="Database service misconfigured for posts")
     return request.app.state.db
@@ -84,7 +80,6 @@ async def get_gcs_client(request: Request) -> storage.Client:
         logger.error("GCS client not initialized or unavailable.")
         raise HTTPException(status_code=503, detail="GCS service unavailable")
     return request.app.state.gcs_client
-
 
 async def upload_to_gcs(
     gcs_client: storage.Client,
@@ -100,11 +95,6 @@ async def upload_to_gcs(
         safe_filename = f"{uuid.uuid4()}_{filename.replace(' ', '_')}"
         blob_name = f"post_images/{username}/{safe_filename}"
         blob = bucket.blob(blob_name)
-        # Note: blob.upload_from_string is synchronous.
-        # For a fully async GCS upload, you'd typically use aiohttp or similar
-        # with GCS's resumable upload API, or run this in a thread pool.
-        # For simplicity with the official library, this remains synchronous here.
-        # If this becomes a bottleneck, consider libraries like gcloud-aio-storage.
         blob.upload_from_string(image_bytes, content_type=content_type)
         logger.info(f"File {filename} uploaded to gs://{GCS_BUCKET_NAME}/{blob_name}")
         return blob.public_url
@@ -112,16 +102,61 @@ async def upload_to_gcs(
         logger.exception(f"Failed to upload {filename} to GCS for user {username}: {e}")
         return None
 
-# --- Post API Routes ---
+def generate_post_slug(title: str) -> str:
+    """
+    Generates a Firestore-friendly document ID (slug) from a title.
+    """
+    if not title or not title.strip():
+        # Fallback for empty or whitespace-only titles
+        return f"untitled-post-{uuid.uuid4().hex[:12]}"
 
+    # Convert to lowercase and strip leading/trailing whitespace
+    slug = title.lower().strip()
+
+    # Replace non-alphanumeric characters (excluding hyphens) with an empty string.
+    # This step handles many special characters.
+    slug = re.sub(r'[^\w\s-]', '', slug)
+
+    # Replace whitespace and sequences of hyphens with a single hyphen
+    slug = re.sub(r'[-\s]+', '-', slug)
+
+    # Remove leading/trailing hyphens that might have formed
+    slug = slug.strip('-')
+
+    # If slug becomes empty after processing (e.g., title was "!!! ???"), generate a unique one
+    if not slug:
+        return f"untitled-post-{uuid.uuid4().hex[:12]}"
+
+    # Firestore ID constraints checks (simplified for common cases)
+    if slug == "." or slug == "..":
+        slug = f"post-{slug}-{uuid.uuid4().hex[:8]}" # Append uuid to make it valid
+
+    # Ensure slug doesn't start and end with double underscores (Firestore reserved)
+    if slug.startswith("__") and slug.endswith("__"):
+         # A simple way to break the pattern, e.g., by prefixing
+        slug = f"post-{slug}"
+
+    # Truncate to a maximum length to avoid overly long IDs
+    if len(slug) > MAX_SLUG_LENGTH:
+        slug = slug[:MAX_SLUG_LENGTH].rsplit('-', 1)[0] # Truncate and try to cut at a hyphen
+        slug = slug.strip('-') # Clean up if truncation left a hyphen
+
+    # Final check if slug became empty after truncation
+    if not slug:
+        return f"final-fallback-post-{uuid.uuid4().hex[:12]}"
+
+    return slug
+
+
+# --- Post API Routes (get_all_post_snippets, get_post_by_id as before) ---
 @router.get("/", response_model=List[PostSnippet])
 async def get_all_post_snippets(
-    db: AsyncClient = Depends(get_firestore_client) # Use AsyncClient
+    db: AsyncClient = Depends(get_firestore_client)
 ):
+    # ... (implementation as before) ...
     posts_collection = db.collection('posts')
     try:
         all_post_snippets = []
-        # Use "async for" with .stream() for AsyncClient
         async for doc in posts_collection.order_by("date", direction=firestore.Query.DESCENDING).stream():
             post_data = doc.to_dict()
             post_data['id'] = doc.id
@@ -138,21 +173,21 @@ async def get_all_post_snippets(
         logger.exception(f"Error retrieving all post snippets: {e}")
         raise HTTPException(status_code=500, detail="Internal server error while fetching post snippets")
 
-
 @router.get("/{post_id}", response_model=Post)
 async def get_post_by_id(
     post_id: str,
-    db: AsyncClient = Depends(get_firestore_client) # Use AsyncClient
+    db: AsyncClient = Depends(get_firestore_client)
 ):
+    # ... (implementation as before) ...
     posts_collection = db.collection('posts')
     try:
         post_ref = posts_collection.document(post_id)
-        post_doc = await post_ref.get() # Use await for .get()
+        post_doc = await post_ref.get()
         if not post_doc.exists:
             logger.warning(f"Post document with ID {post_id} not found.")
             raise HTTPException(status_code=404, detail=f"Post with id {post_id} not found")
         post_data = post_doc.to_dict()
-        post_data['id'] = post_doc.id
+        post_data['id'] = post_doc.id # Ensure 'id' is part of the data for model validation
         return Post(**post_data)
     except HTTPException as http_exc:
         raise http_exc
@@ -167,12 +202,12 @@ async def create_post(
     title: str = Form(...),
     snippet: str = Form(...),
     content: str = Form(...),
-    date: Optional[str] = Form(default=None), # Dates are tricky with forms, ensure frontend sends ISO
+    date: Optional[str] = Form(default=None),
     image_file: Optional[UploadFile] = File(default=None, description=f"Optional image file (max {MAX_IMAGE_SIZE_KB} KB)"),
-    db: AsyncClient = Depends(get_firestore_client), # Use AsyncClient
+    db: AsyncClient = Depends(get_firestore_client),
     gcs: storage.Client = Depends(get_gcs_client)
 ):
-    if current_user.username != "mrkiouak@gmail.com": # Example authorization
+    if current_user.username != "mrkiouak@gmail.com":
         raise HTTPException(status_code=403, detail="You are not authorized to post.")
 
     if len(title.encode('utf-8')) > MAX_TEXT_FIELD_SIZE_BYTES or \
@@ -183,6 +218,34 @@ async def create_post(
             detail=f"One or more text fields exceed the maximum size of {MAX_TEXT_FIELD_SIZE_KB} KB."
         )
 
+    # Generate the document ID (slug) from the title
+    try:
+        post_id_slug = generate_post_slug(title)
+        if not post_id_slug: # Should be handled by generate_post_slug, but as a safeguard
+            raise ValueError("Generated post ID slug is empty.")
+    except ValueError as ve:
+        logger.error(f"Error generating post ID slug from title '{title}': {ve}")
+        raise HTTPException(status_code=400, detail=f"Could not generate a valid ID from the title: {ve}")
+
+    logger.info(f"Generated post ID slug: '{post_id_slug}' from title: '{title}'")
+
+    posts_collection = db.collection('posts')
+    post_ref = posts_collection.document(post_id_slug)
+
+    # Check if a document with this generated ID already exists
+    try:
+        existing_doc = await post_ref.get()
+        if existing_doc.exists:
+            logger.warning(f"Post with generated ID '{post_id_slug}' (from title '{title}') already exists.")
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=f"A post with a title that generates the ID '{post_id_slug}' already exists. Please choose a different title."
+            )
+    except Exception as e:
+        logger.exception(f"Error checking for existing post with ID '{post_id_slug}': {e}")
+        raise HTTPException(status_code=500, detail="Error checking for existing post.")
+
+
     image_public_url: Optional[str] = None
     if image_file and image_file.filename:
         image_bytes = await image_file.read()
@@ -192,7 +255,6 @@ async def create_post(
                 status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
                 detail=f"Image file size exceeds the limit of {MAX_IMAGE_SIZE_KB} KB."
             )
-        # upload_to_gcs is currently synchronous. Consider making it async if it's a bottleneck.
         image_public_url = await upload_to_gcs(
             gcs_client=gcs,
             image_bytes=image_bytes,
@@ -206,8 +268,6 @@ async def create_post(
     processed_date_str: str
     if date:
         try:
-            # Attempt to parse the date string. Assumes YYYY-MM-DD format from form.
-            # For more robust date handling, consider a date parsing library or stricter validation.
             parsed_date = datetime.datetime.fromisoformat(date.replace('Z', '+00:00')).date()
             processed_date_str = parsed_date.isoformat()
         except ValueError:
@@ -216,46 +276,47 @@ async def create_post(
         processed_date_str = datetime.date.today().isoformat()
 
     new_post_data_dict = {
-        "title": title,
+        "title": title, # Original title is stored in the document body
         "snippet": snippet,
         "content": content,
         "author": current_user.username,
-        "date": processed_date_str, # Store as ISO string
-        "imageUrl": image_public_url
-        # Firestore will store the date string. If you need it as a Firestore Timestamp,
-        # you might convert it: firestore.SERVER_TIMESTAMP or datetime.datetime.strptime(...)
-        # For consistency with your model (str | datetime.date), string is fine.
+        "date": processed_date_str,
+        "imageUrl": image_public_url,
+        # Do NOT include 'id' here, it's the document key
     }
 
     try:
-        posts_collection = db.collection('posts')
-        # .add() returns a tuple (timestamp, document_reference)
-        # For AsyncClient, .add() is a coroutine
-        timestamp, doc_ref = await posts_collection.add(new_post_data_dict)
-        logger.info(f"User '{current_user.username}' created post {doc_ref.id} with image URL {image_public_url} at {timestamp}")
+        # Use .set() with the generated post_id_slug
+        await post_ref.set(new_post_data_dict)
+        # The timestamp of write is not directly returned by .set() like .add()
+        # If you need it, you'd typically add a server_timestamp field in new_post_data_dict
+        # For logging, we can log the successful write.
+        logger.info(f"User '{current_user.username}' created post with ID '{post_id_slug}' and image URL {image_public_url}")
 
-        # Construct the response model
-        response_data = Post(id=doc_ref.id, **new_post_data_dict)
+        # Construct the response model, explicitly passing the generated ID
+        response_data = Post(id=post_id_slug, **new_post_data_dict)
         return response_data
     except Exception as e:
-        logger.exception(f"Error creating Firestore post for user '{current_user.username}': {e}")
+        logger.exception(f"Error creating Firestore post with ID '{post_id_slug}' for user '{current_user.username}': {e}")
         raise HTTPException(status_code=500, detail="Internal server error while creating post")
 
-# --- Comment API Routes ---
 
+# --- Comment API Routes (as before) ---
+# ... (rest of the Comment API routes: create_comment, get_comments_for_post, get_comment_by_id)
 COMMENTS_SUBCOLLECTION = "comments"
 
 @router.post("/{post_id}/comments/", response_model=Comment, status_code=status.HTTP_201_CREATED)
 async def create_comment(
     post_id: str,
     comment_in: CommentBase,
-    db: AsyncClient = Depends(get_firestore_client), # Use AsyncClient
+    db: AsyncClient = Depends(get_firestore_client),
     current_user: auth.User = Depends(auth.get_current_active_user)
 ):
+    # ... (implementation as before) ...
     posts_collection = db.collection('posts')
     post_ref = posts_collection.document(post_id)
 
-    post_doc = await post_ref.get() # Use await
+    post_doc = await post_ref.get()
     if not post_doc.exists:
         logger.warning(f"Attempt to comment on non-existent post {post_id} by user {current_user.username}")
         raise HTTPException(status_code=404, detail=f"Post with id {post_id} not found.")
@@ -265,22 +326,17 @@ async def create_comment(
             status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
             detail=f"Comment content exceeds the maximum size of {MAX_TEXT_FIELD_SIZE_KB} KB."
         )
-
-    # Create the full Comment object for storage and response
     new_comment_obj = Comment(
-        # id and date are set by default_factory in the model
         post_id=post_id,
         author=current_user.username,
         content=comment_in.content,
         parent_comment_id=comment_in.parent_comment_id,
     )
-
     try:
         comment_doc_ref = post_ref.collection(COMMENTS_SUBCOLLECTION).document(new_comment_obj.id)
-        await comment_doc_ref.set(new_comment_obj.model_dump()) # Use await for .set()
-
+        await comment_doc_ref.set(new_comment_obj.model_dump())
         logger.info(f"User '{current_user.username}' created comment '{new_comment_obj.id}' on post '{post_id}'")
-        return new_comment_obj # Return the Pydantic model instance
+        return new_comment_obj
     except Exception as e:
         logger.exception(f"Error creating comment for post '{post_id}' by user '{current_user.username}': {e}")
         raise HTTPException(status_code=500, detail="Internal server error while creating comment.")
@@ -288,23 +344,20 @@ async def create_comment(
 @router.get("/{post_id}/comments/", response_model=List[Comment])
 async def get_comments_for_post(
     post_id: str,
-    db: AsyncClient = Depends(get_firestore_client) # Use AsyncClient
+    db: AsyncClient = Depends(get_firestore_client)
 ):
+    # ... (implementation as before) ...
     posts_collection = db.collection('posts')
     post_ref = posts_collection.document(post_id)
-
-    post_doc = await post_ref.get() # Use await
+    post_doc = await post_ref.get()
     if not post_doc.exists:
         logger.warning(f"Attempt to get comments for non-existent post {post_id}")
         raise HTTPException(status_code=404, detail=f"Post with id {post_id} not found.")
-
     try:
         comments_query = post_ref.collection(COMMENTS_SUBCOLLECTION).order_by("date", direction=firestore.Query.ASCENDING)
         all_comments = []
-        async for doc in comments_query.stream(): # Use "async for"
+        async for doc in comments_query.stream():
             comment_data = doc.to_dict()
-            # The ID is already in comment_data if stored correctly from model_dump,
-            # but good to ensure it's explicitly set from doc.id for the response model
             comment_data['id'] = doc.id
             try:
                 all_comments.append(Comment(**comment_data))
@@ -321,28 +374,25 @@ async def get_comments_for_post(
 async def get_comment_by_id(
     post_id: str,
     comment_id: str,
-    db: AsyncClient = Depends(get_firestore_client) # Use AsyncClient
+    db: AsyncClient = Depends(get_firestore_client)
 ):
+    # ... (implementation as before) ...
     posts_collection = db.collection('posts')
     post_ref = posts_collection.document(post_id)
-
-    post_doc = await post_ref.get() # Use await
+    post_doc = await post_ref.get()
     if not post_doc.exists:
         logger.warning(f"Attempt to get specific comment from non-existent post {post_id}")
         raise HTTPException(status_code=404, detail=f"Post with id {post_id} not found.")
-
     try:
         comment_doc_ref = post_ref.collection(COMMENTS_SUBCOLLECTION).document(comment_id)
-        comment_doc = await comment_doc_ref.get() # Use await
-
+        comment_doc = await comment_doc_ref.get()
         if not comment_doc.exists:
             logger.warning(f"Comment {comment_id} not found in post {post_id}")
             raise HTTPException(status_code=404, detail=f"Comment with id {comment_id} not found in post {post_id}.")
-
         comment_data = comment_doc.to_dict()
         comment_data['id'] = comment_doc.id
         return Comment(**comment_data)
-    except HTTPException as http_exc: # Re-raise HTTP exceptions
+    except HTTPException as http_exc:
         raise http_exc
     except Exception as e:
         logger.exception(f"Error retrieving comment {comment_id} for post {post_id}: {e}")

@@ -27,7 +27,7 @@ from services.ai_story_utils import (
 logger = logging.getLogger('uvicorn.error')
 
 IMAGE_GEN_MODEL_NAME_CONFIG = "imagen-3.0-generate-002"
-TEXT_GEN_MODEL_NAME_CONFIG = "gemini-2.5-flash-preview-04-17"  # Or your preferred/available model
+TEXT_GEN_MODEL_NAME_CONFIG = "gemini-2.5-flash-preview-05-20"  # Or your preferred/available model
 GCS_BUCKET_NAME_CONFIG = "musings-mr.net"
 GCP_PROJECT_ID = "clojure-gen-blog"
 GCP_LOCATION = "us-central1"

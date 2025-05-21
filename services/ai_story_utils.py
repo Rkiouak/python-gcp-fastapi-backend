@@ -29,8 +29,36 @@ def build_story_generation_prompt(previous_story_text: str, user_idea: str) -> s
 Your task is to continue the story based on the "Previous Story" and the "User's Idea".
 You must also suggest a "nextUserPrompt" to ask the user what should happen next.
 Your response MUST be a valid JSON object with two keys: "storyContinuation" and "nextUserPrompt".
-The "storyContinuation" should be a few engaging sentences (2-4 sentences) in a style suitable for young children, continuing the narrative.
+The "storyContinuation" should be a few engaging sentences (3-6 sentences) in a style suitable for young children, continuing the narrative.
 The "nextUserPrompt" should be a question to the user, guiding them to provide the next story beat.
+
+Your "storyContinuation" MUST move the story forward, not just describe the user's idea. Stories should follow a a traditional
+style structure, such as that described in Joseph Campbell's "The Hero's Journey".
+
+For instance:
+ 
+ 1. The 1st storyContinuation, when there is no previous content, should introduce the character's in the story,
+describing identifying appearance details and hinting at the character's different personalities. The continuation should
+end with a surprising event who's outcome is uncertain, a 'cliffhanger' or a challenge, and the nextUserPrompt should
+suggest some possible choices the characters could make to deal with the surprising event and resolve uncertainty.
+
+2. The next step in story structure should further establish character's personalities and relationships, and clearly
+identify an obstacle and challenge the character's must overcome. Possibly introducing a new character that can act as a
+mentor or guide to the main characters. The nextUserPrompt should suggest some possible choices the characters could make
+to resolve the obstacle or challenge they now face
+
+3. The next story milestone should reveal that the challenge the characters face is larger than any of them expected, and
+events should introduce doubt that the characters will be able to overcome the challenge. The nextUserPrompt should ask
+for a novel solution for overcoming the challenge, or prompt the user to identify a character who comes up with a solution.
+
+4. The next story milestone should reveal that the characters have made a decision or taken an action that will bring
+them to the obstacle or challenge directly, and result in them successfully resolving the problem.
+
+5. The final milestone should provide closure and denouement to the events in the story, calling back to details from the
+very beginning of the story. The nextUserPrompt should setup establishing a new challenge, and the pattern would then repeat
+through the other story milestones.
+
+You should avoid repeating milestones, or diverging for more than a few sentences from following this structure.
 
 Example 1:
 Previous Story:
@@ -148,15 +176,17 @@ async def generate_and_upload_image(
     imagen_prompt = (
         f"Illustrate the following scene from a children's fairy tale or myth: \"{current_story_segment}\"\n\n"
         f"CONTEXT from the story so far: \"{full_story_context}\"\n\n"
-        f"The image should be in a whimsical, vibrant, and engaging style suitable for a children's storybook. "
+        f"The image should be in a whimsical, vibrant, and engaging style suitable for a children's storybook with a"
+        f"realistic and occasionally darker style typically found in 1970s & 80s animation styles. "
         f"Focus on the characters, actions, and atmosphere described in the LATEST scene. "
         f"Ensure visual consistency with the described context if possible (e.g., character appearance, setting details mentioned previously)."
         f"If specific characters were described (e.g. 'a squirrel named Squeaky with a blue-striped tail'), try to incorporate those details."
+        f" Do NOT include a squirrel in the image if it is not described in the story. "
     )
     # Limit prompt length if necessary, though Imagen handles reasonably long prompts.
     # A very long full_story_context might be truncated by the model or API.
     # Consider summarizing full_story_context if it becomes excessively long.
-    max_prompt_length = 8000 # Example limit, check Imagen documentation for actual limits
+    max_prompt_length = 10000 # Example limit, check Imagen documentation for actual limits
     if len(imagen_prompt) > max_prompt_length:
         # Basic truncation strategy, could be more sophisticated
         truncate_by = len(imagen_prompt) - max_prompt_length
